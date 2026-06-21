@@ -137,40 +137,79 @@ async function suggestPlex(query) {
 let playbackCtx = null;
 let streamProcess = null;
 
-function killStreamer() {
-  if (streamProcess) {
-    console.debug(`[debug] Killing old stream-child (pid=${streamProcess.pid})`);
-    // Mark this exit as intentional so its exit handler never triggers autoplay.
-    // This is the EOF-vs-kill guard: every deliberate stop/replace flows through here.
-    streamProcess._intentional = true;
-    streamProcess.kill("SIGKILL");
-    streamProcess = null;
-  }
+// ---- Persistent stream child --------------------------------------------
+// One long-lived stream-child holds the Discord voice connection + Go-Live
+// session open for the whole session. We feed it episodes over IPC instead of
+// respawning per episode, so autoplay / !pnext / !pqp swap media WITHOUT tearing
+// down the Go-Live tile — viewers never have to rejoin the watch-together.
+let childChannelId = null;   // voice channel the live child is joined to
+let childStopping = false;   // true when WE asked the child to stop (vs. a crash)
+let lastStartedAt = 0;       // when the current item actually began playing
+
+// The episode currently selected in playbackCtx, as a child "play" payload.
+function currentItem() {
+  const s = playbackCtx.seasons[playbackCtx.currentSeason];
+  const ep = s.episodes[playbackCtx.currentEpisode];
+  const S = s.seasonIndex ?? (playbackCtx.currentSeason + 1);
+  const E = ep.epIndex ?? (playbackCtx.currentEpisode + 1);
+  return { filePath: ep.filePath, title: ep.title, S, E };
 }
 
-function spawnStreamer() {
-  if (!playbackCtx) return;
-  const S = playbackCtx.currentSeason + 1;
-  const E = playbackCtx.currentEpisode + 1;
-  console.debug(`[debug] Spawning stream-child at Season ${S} Episode ${E}`);
+function attachChild(child) {
+  child.on("message", m => {
+    if (!m || typeof m !== "object") return;
+    if (m.type === "started") {
+      lastStartedAt = Date.now();
+      console.debug("[child] started:", m.title);
+    } else if (m.type === "ended") {
+      onItemEnded();
+    } else if (m.type === "failed") {
+      onItemFailed(m);
+    }
+  });
+  child.on("exit", (code, sig) => {
+    console.debug(`[debug] stream-child exited code=${code} signal=${sig}`);
+    const wasStopping = childStopping;
+    if (child === streamProcess) { streamProcess = null; childChannelId = null; }
+    childStopping = false;
+    // An exit we didn't request = the child crashed. Don't autoplay; tell the channel.
+    if (!wasStopping) notify(playbackCtx, "⚠️ Stream process crashed — use !pplay to restart.");
+  });
+}
+
+function ensureChild() {
+  if (streamProcess) return streamProcess;
+  console.debug("[debug] Forking persistent stream-child");
   const child = fork(
     path.join(__dirname, "stream-child.js"),
     [],
     { stdio: ["inherit","inherit","inherit","ipc"] }
   );
-  child._startedAt = Date.now();
   streamProcess = child;
-  child.on("message", m => console.debug("[stream-child]", m));
-  child.on("exit", (code, sig) => {
-    console.debug(`[debug] stream-child exited code=${code} signal=${sig}`);
-    // We SIGKILLed it (pstop / replaced by a new selection) — never autoplay.
-    if (child._intentional) return;
-    // A newer child already took over (defensive; shouldn't happen w/o a kill).
-    if (streamProcess !== child) return;
-    streamProcess = null;
-    handleStreamEnded(child, code, sig);
-  });
-  child.send(playbackCtx);
+  childStopping = false;
+  attachChild(child);
+  return child;
+}
+
+// Play the currently-selected episode on the live child (seamless), forking a
+// child first if none is running.
+function sendPlay() {
+  if (!playbackCtx) return;
+  const item = currentItem();
+  const child = ensureChild();
+  childChannelId = playbackCtx.voiceChannel.channelId;
+  console.debug(`[debug] -> play S${item.S}E${item.E}: ${item.title}`);
+  child.send({ type: "play", ctx: { voiceChannel: playbackCtx.voiceChannel }, item });
+}
+
+// Gracefully stop + disconnect the child (it tears down voice/Go-Live and exits).
+function stopChild() {
+  if (!streamProcess) return;
+  childStopping = true;
+  try { streamProcess.send({ type: "stop" }); }
+  catch (e) { try { streamProcess.kill("SIGKILL"); } catch (e2) {} }
+  streamProcess = null;
+  childChannelId = null;
 }
 
 // Advance playback by `delta` episodes, walking across season boundaries.
@@ -208,36 +247,34 @@ async function notify(ctx, text) {
   }
 }
 
-// Called only on an UNINTENTIONAL child exit (natural EOF or crash).
-function handleStreamEnded(child, code, sig) {
+// The child emits "ended" ONLY on a genuine end-of-file (never when we switch
+// away to another episode), so this is a clean EOF signal — no exit-code guessing.
+function onItemEnded() {
   const ctx = playbackCtx;
   if (!ctx) return;
-  const playedMs = Date.now() - (child._startedAt || Date.now());
-
-  // Abnormal exit (child threw -> exit 1, or killed by a signal we didn't send):
-  // do NOT autoplay, or a failing item would crash-loop through the whole show.
-  if (sig || code !== 0) {
-    console.debug("[debug] abnormal stream end — autoplay suppressed");
-    notify(ctx, `⚠️ Stream ended unexpectedly. Autoplay paused — use !pnext to continue.`);
-    return;
-  }
-  if (!autoplay) return;  // clean EOF, autoplay off -> just stop, no message
-
-  // Clean exit but far too short to be a real episode -> treat as a silent failure.
+  const playedMs = Date.now() - (lastStartedAt || Date.now());
+  if (!autoplay) { console.debug("[debug] item ended; autoplay off"); return; }
+  // Too short to be a real episode -> treat as a glitch; don't burn through the show.
   if (playedMs < MIN_PLAY_MS) {
-    console.debug(`[debug] clean exit after only ${playedMs}ms — autoplay suppressed`);
-    notify(ctx, `⚠️ Stream ended after only ${Math.round(playedMs/1000)}s. Autoplay paused — use !pnext to continue.`);
+    console.debug(`[debug] item ended after only ${playedMs}ms — autoplay suppressed`);
+    notify(ctx, `⚠️ Episode ended after only ${Math.round(playedMs/1000)}s — autoplay paused. Use !pnext to continue.`);
     return;
   }
-
   const adv = advanceCtx(1);
   if (!adv.ok) {
     notify(ctx, "📺 Reached the end — nothing left to autoplay.");
     return;
   }
   console.debug(`[debug] Autoplay -> S${adv.S}E${adv.E}: ${adv.title}`);
-  notify(ctx, `⏭️ Autoplay → (S${adv.S}E${adv.E}): ${adv.title}`);
-  spawnStreamer();
+  notify(ctx, `⏭️ Up next (S${adv.S}E${adv.E}): ${adv.title}`);
+  sendPlay();  // seamless — same Go-Live tile, new media
+}
+
+// Child couldn't play an item (ffmpeg/demux error). Pause autoplay; keep the
+// session open so viewers stay and the user can !pnext / !pplay again.
+function onItemFailed(m) {
+  if (m && m.fatal) { streamProcess = null; childChannelId = null; }
+  notify(playbackCtx, `⚠️ Couldn't play ${m && m.title ? `"${m.title}"` : "that item"} — autoplay paused. Try !pnext or !pplay again.`);
 }
 
 const client = new Client({ checkUpdate: false });
@@ -369,8 +406,10 @@ client.on("messageCreate", async msg => {
       const nowTitle = curEp.title;
       await msg.reply(`▶️ Now playing (S${S0}E${E0}): ${nowTitle}`);
 
-      killStreamer();
-      spawnStreamer();
+      // If the live child is on a different voice channel, restart it there;
+      // otherwise reuse the open Go-Live session for a seamless switch.
+      if (childChannelId && childChannelId !== voice.id) stopChild();
+      sendPlay();
     }
 
     else if (cmd === "!pnext" || cmd === "!pback") {
@@ -382,8 +421,7 @@ client.on("messageCreate", async msg => {
       }
       await msg.reply(`▶️ Now playing (S${adv.S}E${adv.E}): ${adv.title}`);
 
-      killStreamer();
-      spawnStreamer();
+      sendPlay();
     }
 
     else if (cmd === "!pautoplay") {
@@ -414,13 +452,12 @@ client.on("messageCreate", async msg => {
       const t2 = seasons[si].episodes[ei].title;
       await msg.reply(`▶️ Now playing (S${S2}E${E2}): ${t2}`);
 
-      killStreamer();
-      spawnStreamer();
+      sendPlay();
     }
 
     else if (cmd === "!pstop") {
       console.debug("[debug] pstop");
-      killStreamer();
+      stopChild();
       await msg.reply("⏹ Stream stopped.");
     }
   } catch (err) {
