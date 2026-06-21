@@ -1,10 +1,10 @@
 {
-  "token": "DISCORDAUTHTOKEN",
-  "acceptedAuthors": ["YOURUSERID"],
+  "token": "DISCORD_USER_TOKEN",
+  "acceptedAuthors": ["YOUR_DISCORD_USER_ID"],
 
   "plex": {
-    "host": "http://192.168.1.1:32400",
-    "token": "PLEXTOKEN"
+    "host": "http://PLEX_HOST:32400",
+    "token": "PLEX_TOKEN"
   },
 
   "streamOpts": {
@@ -13,8 +13,12 @@
     "fps": 30,
     "bitrateKbps": 5000,
     "maxBitrateKbps": 8000,
-    "hardware_acceleration": true,
-    "videoCodec": "h264"
+    "hardware_acceleration": false,
+    "videoCodec": "h264",
+    "nvenc": true
   },
-  "audioBitrateKbps": 128
+  "audioBitrateKbps": 128,
+
+  "allowedGuilds": ["STREAM_GUILD_ID"],
+  "autoplay": true
 }

@@ -1,0 +1,13 @@
+# Secrets — NEVER commit (contains live Discord + Plex tokens)
+config.json
+
+# Dependencies (reinstall with `npm install`)
+node_modules/
+
+# Local working backups
+*.pre-autoplay
+*.presearch
+*.pretvfix
+*.orig
+*.bak
+*.diagbak

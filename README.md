@@ -6,6 +6,29 @@ Discord self-bot that joins your voice channel and plays Plex movies or TV episo
 
 ---
 
+## 🍴 Homelab fork notes (StonyTark1117)
+
+This is a personal fork of [TheNameIsNigel/PoD](https://github.com/TheNameIsNigel/PoD), kept as a backup of a working deployment. Sync upstream with `git fetch upstream && git merge upstream/main`. It diverges from upstream in a few ways that matter for reinstallation:
+
+**Requirements (stricter than upstream):**
+- **Node.js 22.x** (not v16). `@dank074/discord-video-stream@6.0.0` needs Node's global `WebSocket`.
+- FFmpeg with `h264_nvenc`/`hevc_nvenc` if using GPU encode (see NVENC below).
+
+**Pinned dependencies (`package.json`):** `@dank074/discord-video-stream@6.0.0` (v6 ships the **DAVE/E2EE** support Discord enforced on 2026-03-02 — older versions get voice close code **4017** and never stream) and `discord.js-selfbot-v13@^3.7.1` (v1.x crashes on Discord's modern READY payload).
+
+**⚠️ Required patch after every `npm install`** (`node_modules` is intentionally not committed): v6's `dist/media/newApi.js` adds an `azmq` audio filter whose escaping breaks FFmpeg 5.1.x (`No option name near '//...:42069'` → *Conversion failed*). Comment out the `command.audioFilters('azmq=...')` line. Without this, audio streams fail to start.
+
+**Config additions over upstream** (`config.example.json`):
+- `allowedGuilds`: array of guild IDs. **Auth is guild-based** — anyone messaging in a listed guild may drive the bot; `acceptedAuthors` is kept only as an owner override (e.g. DM control).
+- `autoplay` (default `true`): on a clean end-of-episode, roll into the next episode. Guarded so an intentional stop or a crash never auto-advances (only a genuine EOF that played long enough does).
+- `streamOpts.nvenc` (`true`/`false`): use `h264_nvenc` (GPU) vs `libx264` (CPU). For GPU on an LXC you must pass the device through and `ldconfig` the NVIDIA libs inside the container.
+
+**Extra commands beyond upstream:** `!pqp <season>-<episode>` (jump to a specific episode), `!pautoplay on|off` (toggle auto-advance at runtime). `!pplay` also accepts `SxxExx` / `NxNN` and strips `(YYYY)` from titles, e.g. `!pplay house s3e1`.
+
+**Never commit `config.json`** — it holds live Discord and Plex tokens. Only `config.example.json` (placeholders) belongs in git.
+
+---
+
 ## 🔑 Features
 
 - **Search & Play**: `!pplay Agents of S.H.I.E.L.D ` finds movies or TV shows in Plex and starts streaming.  

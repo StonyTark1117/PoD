@@ -4,7 +4,135 @@ const { Client } = require("discord.js-selfbot-v13");
 const axios = require("axios");
 const config = require("./config.json");
 
-const COMMANDS = ["!pplay", "!pnext", "!pback", "!pstop", "!pqp"];
+const COMMANDS = ["!pplay", "!pnext", "!pback", "!pstop", "!pqp", "!pautoplay"];
+
+// When a TV episode finishes cleanly, optionally roll into the next episode.
+// Runtime-mutable via !pautoplay on/off; default comes from config (off if unset).
+// Off by default so an unattended crash/disconnect can't burn through a whole show.
+let autoplay = config.autoplay === true;
+// Suppress autoplay if a "clean" exit happened suspiciously fast (real episodes
+// run far longer than this) — a second guard against crash-loops even if the
+// child reports success after a mid-stream failure.
+const MIN_PLAY_MS = 90 * 1000;
+
+// --- Plex search ---------------------------------------------------------
+// /hubs/search is the punctuation-tolerant, app-style ranked search; the old
+// /search endpoint required near-exact titles (e.g. "batman bad blood" -> 0,
+// only "batman: bad blood" matched). We hub-search, fall back to a per-section
+// title substring scan, then rank by how well each title matches the query.
+const plexGet = (p, params = {}) =>
+  axios.get(`${config.plex.host}${p}`, {
+    params: { ...params, "X-Plex-Token": config.plex.token },
+    headers: { Accept: "application/json" }
+  }).then(r => r.data);
+
+const PLAYABLE = new Set(["movie", "show", "season", "episode"]);
+const norm = s => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+// Pull an episode target (SxxExx / sN eN / NxNN) and a parenthesized (YYYY)
+// disambiguator out of the query so "house s3e1" / "house (2004)" find the show.
+// We only strip YEARS in parentheses — bare years can be real titles (e.g. "1917",
+// "Blade Runner 2049"), so those are left in the search text.
+function parseQuery(rawQuery) {
+  let q = rawQuery;
+  let epTarget = null;
+  const m = q.match(/\b[sS](\d{1,2})\s*[eExX](\d{1,3})\b/) ||
+            q.match(/(?:^|\s)(\d{1,2})x(\d{1,3})(?=\s|$)/);
+  if (m) {
+    epTarget = { season: parseInt(m[1], 10), episode: parseInt(m[2], 10) };
+    q = q.replace(m[0], " ");
+  }
+  q = q.replace(/\(\s*(?:19|20)\d{2}\s*\)/g, " ").replace(/\s+/g, " ").trim();
+  return { query: q || rawQuery.trim(), epTarget };
+}
+
+function matchScore(title, query) {
+  const t = norm(title), q = norm(query);
+  if (!t || !q) return 0;
+  if (t === q) return 100;
+  if (t.startsWith(q)) return 80;
+  if (t.includes(q)) return 60;
+  const qt = q.split(" ").filter(Boolean);
+  const hits = qt.filter(w => t.includes(w)).length;
+  return qt.length ? (hits / qt.length) * 40 : 0;
+}
+
+let _sections = null;
+async function playableSections() {
+  if (_sections) return _sections;
+  const d = await plexGet("/library/sections");
+  _sections = (d.MediaContainer?.Directory || [])
+    .filter(s => s.type === "movie" || s.type === "show")
+    .map(s => s.key);
+  return _sections;
+}
+
+// Returns playable Plex items ranked best-match first ([] if none).
+async function searchPlex(query) {
+  // Strip punctuation -> spaces so e.g. "batman:bad blood" matches "Batman: Bad Blood".
+  const sq = query.replace(/[^a-zA-Z0-9\s]+/g, " ").replace(/\s+/g, " ").trim() || query;
+  let items = [];
+  try {
+    const d = await plexGet("/hubs/search", { query: sq, limit: 30 });
+    items = (d.MediaContainer?.Hub || []).flatMap(h => h.Metadata || []);
+  } catch (e) { console.debug("[debug] hubs/search error:", e.message); }
+  console.debug("[debug] hubs/search returned", items.length);
+
+  if (!items.some(i => PLAYABLE.has(i.type))) {
+    for (const key of await playableSections()) {
+      try {
+        const d = await plexGet(`/library/sections/${key}/all`, { title: sq });
+        items.push(...(d.MediaContainer?.Metadata || []));
+      } catch (e) { /* ignore section error */ }
+    }
+    console.debug("[debug] section fallback total", items.length);
+  }
+
+  const seen = new Set();
+  return items
+    .filter(i => PLAYABLE.has(i.type))
+    .filter(i => (i.ratingKey && !seen.has(i.ratingKey)) ? seen.add(i.ratingKey) : !i.ratingKey)
+    .map((i, idx) => ({
+      i, idx,
+      score: matchScore(i.title, query) + (i.type === "movie" || i.type === "episode" ? 3 : 0)
+    }))
+    .sort((a, b) => b.score - a.score || a.idx - b.idx)
+    .map(x => x.i);
+}
+
+// When nothing matches the whole query, find titles matching individual words
+// so we can suggest alternatives (e.g. "dark knight" -> "Batman: Gotham Knight",
+// "Transformers: The Last Knight"). Ranked by how many query words each contains.
+async function suggestPlex(query) {
+  const tokens = [...new Set(
+    query.toLowerCase().replace(/[^a-z0-9\s]+/g, " ").split(/\s+/).filter(w => w.length >= 3)
+  )];
+  if (!tokens.length) return [];
+  const pool = new Map();
+  for (const key of await playableSections()) {
+    for (const tok of tokens) {
+      try {
+        const d = await plexGet(`/library/sections/${key}/all`, { title: tok });
+        for (const m of (d.MediaContainer?.Metadata || [])) {
+          if (PLAYABLE.has(m.type) && m.ratingKey) pool.set(m.ratingKey, m);
+        }
+      } catch (e) { /* ignore */ }
+    }
+  }
+  return [...pool.values()]
+    .map(m => {
+      const t = norm(m.title);
+      // weight by summed length of matched tokens: rewards both matching more
+      // words and matching longer/rarer ones (e.g. "knight" > "dark").
+      const weight = tokens.filter(w => t.includes(w)).reduce((s, w) => s + w.length, 0);
+      return { m, weight };
+    })
+    .filter(x => x.weight > 0)
+    .sort((a, b) => b.weight - a.weight || a.m.title.length - b.m.title.length)
+    .slice(0, 5)
+    .map(x => x.m);
+}
+// -------------------------------------------------------------------------
 
 let playbackCtx = null;
 let streamProcess = null;
@@ -12,6 +140,9 @@ let streamProcess = null;
 function killStreamer() {
   if (streamProcess) {
     console.debug(`[debug] Killing old stream-child (pid=${streamProcess.pid})`);
+    // Mark this exit as intentional so its exit handler never triggers autoplay.
+    // This is the EOF-vs-kill guard: every deliberate stop/replace flows through here.
+    streamProcess._intentional = true;
     streamProcess.kill("SIGKILL");
     streamProcess = null;
   }
@@ -22,16 +153,91 @@ function spawnStreamer() {
   const S = playbackCtx.currentSeason + 1;
   const E = playbackCtx.currentEpisode + 1;
   console.debug(`[debug] Spawning stream-child at Season ${S} Episode ${E}`);
-  streamProcess = fork(
+  const child = fork(
     path.join(__dirname, "stream-child.js"),
     [],
-    { stdio: ["pipe","pipe","pipe","ipc"] }
+    { stdio: ["inherit","inherit","inherit","ipc"] }
   );
-  streamProcess.on("message", m => console.debug("[stream-child]", m));
-  streamProcess.on("exit", (code, sig) =>
-    console.debug(`[debug] stream-child exited code=${code} signal=${sig}`)
-  );
-  streamProcess.send(playbackCtx);
+  child._startedAt = Date.now();
+  streamProcess = child;
+  child.on("message", m => console.debug("[stream-child]", m));
+  child.on("exit", (code, sig) => {
+    console.debug(`[debug] stream-child exited code=${code} signal=${sig}`);
+    // We SIGKILLed it (pstop / replaced by a new selection) — never autoplay.
+    if (child._intentional) return;
+    // A newer child already took over (defensive; shouldn't happen w/o a kill).
+    if (streamProcess !== child) return;
+    streamProcess = null;
+    handleStreamEnded(child, code, sig);
+  });
+  child.send(playbackCtx);
+}
+
+// Advance playback by `delta` episodes, walking across season boundaries.
+// Mutates playbackCtx on success. Returns {ok, S, E, title} or {ok:false} at the ends.
+function advanceCtx(delta) {
+  if (!playbackCtx) return { ok: false };
+  let { currentSeason: cs, currentEpisode: ce, seasons } = playbackCtx;
+  ce += delta;
+  if (ce < 0 && cs > 0) {
+    cs--; ce = seasons[cs].episodes.length - 1;
+  } else if (ce >= seasons[cs].episodes.length && cs < seasons.length - 1) {
+    cs++; ce = 0;
+  }
+  if (cs < 0 || cs >= seasons.length ||
+      ce < 0 || ce >= seasons[cs].episodes.length) {
+    return { ok: false };
+  }
+  playbackCtx.currentSeason = cs;
+  playbackCtx.currentEpisode = ce;
+  const S = seasons[cs].seasonIndex ?? (cs + 1);
+  const E = seasons[cs].episodes[ce].epIndex ?? (ce + 1);
+  return { ok: true, S, E, title: seasons[cs].episodes[ce].title };
+}
+
+// Post a message to the text channel the last command came from (the exit
+// handler has no `msg` to reply to). Best-effort; never throws into the caller.
+async function notify(ctx, text) {
+  try {
+    const chId = ctx && ctx.textChannelId;
+    if (!chId) return;
+    const ch = await client.channels.fetch(chId);
+    await ch.send(text);
+  } catch (e) {
+    console.error("[error] notify failed:", e.message);
+  }
+}
+
+// Called only on an UNINTENTIONAL child exit (natural EOF or crash).
+function handleStreamEnded(child, code, sig) {
+  const ctx = playbackCtx;
+  if (!ctx) return;
+  const playedMs = Date.now() - (child._startedAt || Date.now());
+
+  // Abnormal exit (child threw -> exit 1, or killed by a signal we didn't send):
+  // do NOT autoplay, or a failing item would crash-loop through the whole show.
+  if (sig || code !== 0) {
+    console.debug("[debug] abnormal stream end — autoplay suppressed");
+    notify(ctx, `⚠️ Stream ended unexpectedly. Autoplay paused — use !pnext to continue.`);
+    return;
+  }
+  if (!autoplay) return;  // clean EOF, autoplay off -> just stop, no message
+
+  // Clean exit but far too short to be a real episode -> treat as a silent failure.
+  if (playedMs < MIN_PLAY_MS) {
+    console.debug(`[debug] clean exit after only ${playedMs}ms — autoplay suppressed`);
+    notify(ctx, `⚠️ Stream ended after only ${Math.round(playedMs/1000)}s. Autoplay paused — use !pnext to continue.`);
+    return;
+  }
+
+  const adv = advanceCtx(1);
+  if (!adv.ok) {
+    notify(ctx, "📺 Reached the end — nothing left to autoplay.");
+    return;
+  }
+  console.debug(`[debug] Autoplay -> S${adv.S}E${adv.E}: ${adv.title}`);
+  notify(ctx, `⏭️ Autoplay → (S${adv.S}E${adv.E}): ${adv.title}`);
+  spawnStreamer();
 }
 
 const client = new Client({ checkUpdate: false });
@@ -41,8 +247,15 @@ client.on("ready", () => {
 });
 
 client.on("messageCreate", async msg => {
-  console.debug("[debug] Received from", msg.author.username, ":", msg.content);
-  if (!config.acceptedAuthors.includes(msg.author.id)) return;
+  console.debug("[debug] Received from", msg.author.username, "(id=" + msg.author.id + ")", ":", msg.content);
+  // Never react to our own (selfbot) messages — prevents command loops on bot replies.
+  if (msg.author.id === client.user.id) return;
+  if (msg.author.bot) return;
+  // Authorization: anyone messaging in a configured stream guild may command the bot;
+  // owner IDs in acceptedAuthors are always allowed (e.g. for DM control).
+  const inAllowedGuild = msg.guildId && (config.allowedGuilds || []).includes(msg.guildId);
+  const isOwner = (config.acceptedAuthors || []).includes(msg.author.id);
+  if (!inAllowedGuild && !isOwner) return;
 
   const raw = msg.content.trim();
   const cmd = COMMANDS.find(c => raw.startsWith(c));
@@ -56,31 +269,37 @@ client.on("messageCreate", async msg => {
 
   try {
     if (cmd === "!pplay") {
-      const query = raw.slice(cmd.length).trim();
-      if (!query) return msg.reply("❌ You must specify a title.");
+      const rawQuery = raw.slice(cmd.length).trim();
+      if (!rawQuery) return msg.reply("❌ You must specify a title.");
 
-      console.debug("[debug] Searching Plex for:", query);
+      const { query, epTarget } = parseQuery(rawQuery);
+      console.debug("[debug] Searching Plex for:", query, "epTarget:", JSON.stringify(epTarget));
       const { host, token } = config.plex;
 
-      let resp = await axios.get(`${host}/search`, { params: { query, "X-Plex-Token": token } });
-      let items = resp.data.MediaContainer?.Metadata || [];
-      console.debug("[debug] /search returned", items.length);
-
-      if (!items.length) {
-        console.debug("[debug] Fallback to /library/search");
-        resp = await axios.get(`${host}/library/search`, { params: { query, "X-Plex-Token": token } });
-        items = resp.data.MediaContainer?.Metadata || [];
-        console.debug("[debug] /library/search returned", items.length);
-      }
-      if (!items.length) {
-        return msg.reply(`❌ No Plex item for "${query}"`);
+      const results = await searchPlex(query);
+      console.debug("[debug] ranked", results.length, "playable; top:", results[0]?.title);
+      if (!results.length) {
+        const sugg = await suggestPlex(query);
+        if (sugg.length) {
+          const list = sugg.map(m => `• ${m.title}${m.year ? ` (${m.year})` : ""}`).join("\n");
+          return msg.reply(`❓ No match for "${query}". Did you mean:\n${list}`);
+        }
+        return msg.reply(`❌ No Plex match for "${query}". Try fewer/simpler words.`);
       }
 
-      const first = items[0];
+      // If an episode was explicitly requested, prefer a series result over a
+      // like-named movie (movies otherwise get a small ranking bonus).
+      let first = results[0];
+      if (epTarget) {
+        const seriesHit = results.find(r => r.type === "show" || r.type === "season" || r.type === "episode");
+        if (seriesHit) first = seriesHit;
+      }
       playbackCtx = {
         seasons: [],
         currentSeason: 0,
         currentEpisode: 0,
+        // Where to post autoplay/end-of-series notices (exit handler has no msg).
+        textChannelId: msg.channel.id,
         voiceChannel: {
           guildId: voice.guild.id,
           channelId: voice.id
@@ -111,12 +330,25 @@ client.on("messageCreate", async msg => {
           const eps = (epsResp.data.MediaContainer?.Metadata || []).sort((a,b) => a.index - b.index);
           const episodes = eps.map(ep => ({
             title: `${ep.grandparentTitle} S${String(ep.parentIndex).padStart(2,'0')}E${String(ep.index).padStart(2,'0')} – ${ep.title}`,
-            filePath: ep.Media[0].Part[0].file
+            filePath: ep.Media[0].Part[0].file,
+            epIndex: ep.index
           }));
-          playbackCtx.seasons.push({ title: `Season ${s.index}`, episodes });
+          playbackCtx.seasons.push({ title: `Season ${s.index}`, seasonIndex: s.index, episodes });
         }
 
-        if (first.type === "episode") {
+        if (epTarget) {
+          // Jump to an explicit SxxExx, matching on Plex's real season/episode
+          // numbers (handles Specials = Season 0 shifting array positions).
+          const si = playbackCtx.seasons.findIndex(s => s.seasonIndex === epTarget.season);
+          const ei = si >= 0
+            ? playbackCtx.seasons[si].episodes.findIndex(e => e.epIndex === epTarget.episode)
+            : -1;
+          if (si < 0 || ei < 0) {
+            return msg.reply(`❌ Found "${first.title}" but not S${epTarget.season}E${epTarget.episode}.`);
+          }
+          playbackCtx.currentSeason = si;
+          playbackCtx.currentEpisode = ei;
+        } else if (first.type === "episode") {
           outer: for (let si = 0; si < playbackCtx.seasons.length; si++) {
             const eps = playbackCtx.seasons[si].episodes;
             for (let ei = 0; ei < eps.length; ei++) {
@@ -130,10 +362,11 @@ client.on("messageCreate", async msg => {
         }
       }
 
-      const S0 = playbackCtx.currentSeason + 1;
-      const E0 = playbackCtx.currentEpisode + 1;
-      const nowTitle = playbackCtx.seasons[playbackCtx.currentSeason]
-        .episodes[playbackCtx.currentEpisode].title;
+      const curSeason = playbackCtx.seasons[playbackCtx.currentSeason];
+      const curEp = curSeason.episodes[playbackCtx.currentEpisode];
+      const S0 = curSeason.seasonIndex ?? (playbackCtx.currentSeason + 1);
+      const E0 = curEp.epIndex ?? (playbackCtx.currentEpisode + 1);
+      const nowTitle = curEp.title;
       await msg.reply(`▶️ Now playing (S${S0}E${E0}): ${nowTitle}`);
 
       killStreamer();
@@ -143,25 +376,22 @@ client.on("messageCreate", async msg => {
     else if (cmd === "!pnext" || cmd === "!pback") {
       console.debug("[debug] Skip:", cmd);
       if (!playbackCtx) return msg.reply("❌ Nothing playing.");
-      const delta = cmd === "!pnext" ? 1 : -1;
-      let { currentSeason: cs, currentEpisode: ce, seasons } = playbackCtx;
-      ce += delta;
-      if (ce < 0 && cs > 0) {
-        cs--; ce = seasons[cs].episodes.length - 1;
-      } else if (ce >= seasons[cs].episodes.length && cs < seasons.length - 1) {
-        cs++; ce = 0;
-      }
-      if (cs < 0 || cs >= seasons.length) {
+      const adv = advanceCtx(cmd === "!pnext" ? 1 : -1);
+      if (!adv.ok) {
         return msg.reply("⚠️ No more items.");
       }
-      playbackCtx.currentSeason = cs;
-      playbackCtx.currentEpisode = ce;
-      const S1 = cs + 1, E1 = ce + 1;
-      const t1 = seasons[cs].episodes[ce].title;
-      await msg.reply(`▶️ Now playing (S${S1}E${E1}): ${t1}`);
+      await msg.reply(`▶️ Now playing (S${adv.S}E${adv.E}): ${adv.title}`);
 
       killStreamer();
       spawnStreamer();
+    }
+
+    else if (cmd === "!pautoplay") {
+      const arg = raw.slice(cmd.length).trim().toLowerCase();
+      if (arg === "on" || arg === "true" || arg === "1") autoplay = true;
+      else if (arg === "off" || arg === "false" || arg === "0") autoplay = false;
+      else return msg.reply(`📺 Autoplay is **${autoplay ? "on" : "off"}**. Use \`!pautoplay on\` or \`!pautoplay off\`.`);
+      await msg.reply(`📺 Autoplay **${autoplay ? "on" : "off"}**.`);
     }
 
     else if (cmd === "!pqp") {
@@ -179,7 +409,8 @@ client.on("messageCreate", async msg => {
       }
       playbackCtx.currentSeason = si;
       playbackCtx.currentEpisode = ei;
-      const S2 = si + 1, E2 = ei + 1;
+      const S2 = seasons[si].seasonIndex ?? (si + 1);
+      const E2 = seasons[si].episodes[ei].epIndex ?? (ei + 1);
       const t2 = seasons[si].episodes[ei].title;
       await msg.reply(`▶️ Now playing (S${S2}E${E2}): ${t2}`);
 
