@@ -49,6 +49,12 @@ function stopCurrentMedia() {
   if (curController) { try { curController.abort(); } catch (e) {} curController = null; }
   if (curVStream) { try { curVStream.destroy(); } catch (e) {} curVStream = null; }
   if (curAStream) { try { curAStream.destroy(); } catch (e) {} curAStream = null; }
+  // Announce the video track as stopped (video_ssrc:0). playItem() re-announces it
+  // (off->on) once the next episode's frames are ready. Without this off->on cycle,
+  // Discord clients keep the old video SSRC marked "active" while the RTP actually
+  // gapped, so their decoder stalls and freezes on the last frame until a manual
+  // exit/rejoin. The audio SSRC is never toggled, so audio plays straight through.
+  if (conn) { try { conn.mediaConnection.setVideoAttributes(false); } catch (e) {} }
 }
 
 // Log in, join voice, and open the Go-Live stream — ONCE per child lifetime.
