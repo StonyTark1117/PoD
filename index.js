@@ -450,6 +450,14 @@ function startControlApi() {
         try { body = JSON.parse(raw); } catch (e) { return reply(400, { ok: false, error: "bad json" }); }
       }
 
+      // Log every action (skip the noisy autocomplete /search + health polls).
+      if (p !== "/health" && p !== "/search") {
+        const extra = body.query ? ` "${body.query}"`
+          : (body.season != null ? ` S${body.season}E${body.episode}`
+          : (body.on != null ? ` ${body.on ? "on" : "off"}` : ""));
+        console.log(`[control-api] ${req.method} ${p}${extra}`);
+      }
+
       if (req.method === "GET" && p === "/health") return reply(200, { ok: true });
       if (req.method === "GET" && p === "/search") return reply(200, { ok: true, results: await searchSuggest(url.searchParams.get("q") || "") });
       if (req.method === "GET" && p === "/nowplaying") return reply(200, { ok: true, ...nowPlaying() });
