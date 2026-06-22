@@ -1,5 +1,6 @@
 const { fork } = require("child_process");
 const path = require("path");
+const http = require("http");
 const { Client } = require("discord.js-selfbot-v13");
 const axios = require("axios");
 const config = require("./config.json");
@@ -295,6 +296,179 @@ function onItemFailed(m) {
   notify(playbackCtx, `⚠️ Couldn't play ${m && m.title ? `"${m.title}"` : "that item"} — autoplay paused. Try !pnext or !pplay again.`);
 }
 
+// ---- Shared playback logic (used by both ! commands and the control API) ----
+// Resolve a query against Plex, build the playback context, and start streaming.
+// Returns structured data (never touches Discord) so the slash-command bot and
+// the !pplay text handler can both call it and format their own responses.
+async function doPlay({ rawQuery, guildId, channelId, textChannelId }) {
+  if (!rawQuery || !rawQuery.trim()) return { ok: false, reason: "no-query" };
+  if (!guildId || !channelId) return { ok: false, reason: "no-voice" };
+  const { query, epTarget } = parseQuery(rawQuery.trim());
+  const { host, token } = config.plex;
+
+  const results = await searchPlex(query);
+  if (!results.length) {
+    const sugg = await suggestPlex(query);
+    return { ok: false, reason: "not-found", query, suggestions: sugg.map(m => ({ title: m.title, year: m.year })) };
+  }
+
+  let first = results[0];
+  if (epTarget) {
+    const seriesHit = results.find(r => r.type === "show" || r.type === "season" || r.type === "episode");
+    if (seriesHit) first = seriesHit;
+  }
+
+  const ctx = {
+    seasons: [], currentSeason: 0, currentEpisode: 0,
+    textChannelId: textChannelId || null,
+    voiceChannel: { guildId, channelId }
+  };
+
+  if (first.type === "movie") {
+    ctx.seasons.push({ title: first.title, episodes: [{ title: first.title, filePath: first.Media[0].Part[0].file }] });
+  } else {
+    const showKey = first.grandparentRatingKey || first.parentRatingKey || first.ratingKey;
+    const seasonsResp = await axios.get(`${host}/library/metadata/${showKey}/children`, { params: { "X-Plex-Token": token } });
+    const seasons = seasonsResp.data.MediaContainer?.Metadata || [];
+    for (const s of seasons) {
+      const epsResp = await axios.get(`${host}/library/metadata/${s.ratingKey}/children`, { params: { "X-Plex-Token": token } });
+      const eps = (epsResp.data.MediaContainer?.Metadata || []).sort((a, b) => a.index - b.index);
+      const episodes = eps.map(ep => ({
+        title: `${ep.grandparentTitle} S${String(ep.parentIndex).padStart(2, '0')}E${String(ep.index).padStart(2, '0')} – ${ep.title}`,
+        filePath: ep.Media[0].Part[0].file,
+        epIndex: ep.index
+      }));
+      ctx.seasons.push({ title: `Season ${s.index}`, seasonIndex: s.index, episodes });
+    }
+    if (epTarget) {
+      const si = ctx.seasons.findIndex(s => s.seasonIndex === epTarget.season);
+      const ei = si >= 0 ? ctx.seasons[si].episodes.findIndex(e => e.epIndex === epTarget.episode) : -1;
+      if (si < 0 || ei < 0) return { ok: false, reason: "ep-not-found", title: first.title, epTarget };
+      ctx.currentSeason = si; ctx.currentEpisode = ei;
+    } else if (first.type === "episode") {
+      outer: for (let si = 0; si < ctx.seasons.length; si++) {
+        const eps = ctx.seasons[si].episodes;
+        for (let ei = 0; ei < eps.length; ei++) {
+          if (eps[ei].title.includes(first.title)) { ctx.currentSeason = si; ctx.currentEpisode = ei; break outer; }
+        }
+      }
+    }
+  }
+
+  playbackCtx = ctx;
+  const curSeason = playbackCtx.seasons[playbackCtx.currentSeason];
+  const curEp = curSeason.episodes[playbackCtx.currentEpisode];
+  const S = curSeason.seasonIndex ?? (playbackCtx.currentSeason + 1);
+  const E = curEp.epIndex ?? (playbackCtx.currentEpisode + 1);
+  if (childChannelId && childChannelId !== channelId) stopChild();
+  sendPlay();
+  return { ok: true, type: first.type, title: curEp.title, S, E };
+}
+
+// Skip ±1 episode and replay (seamless). Returns the new position or a reason.
+function doSkip(delta) {
+  if (!playbackCtx) return { ok: false, reason: "nothing" };
+  const adv = advanceCtx(delta);
+  if (!adv.ok) return { ok: false, reason: "end" };
+  sendPlay();
+  return { ok: true, S: adv.S, E: adv.E, title: adv.title };
+}
+
+// Jump to a specific REAL season/episode number (not array index).
+function doJump(season, episode) {
+  if (!playbackCtx) return { ok: false, reason: "nothing" };
+  const si = playbackCtx.seasons.findIndex(s => (s.seasonIndex ?? -999) === season);
+  const ei = si >= 0 ? playbackCtx.seasons[si].episodes.findIndex(e => (e.epIndex ?? -999) === episode) : -1;
+  if (si < 0 || ei < 0) return { ok: false, reason: "not-found" };
+  playbackCtx.currentSeason = si; playbackCtx.currentEpisode = ei;
+  sendPlay();
+  const S = playbackCtx.seasons[si].seasonIndex ?? (si + 1);
+  const E = playbackCtx.seasons[si].episodes[ei].epIndex ?? (ei + 1);
+  return { ok: true, S, E, title: playbackCtx.seasons[si].episodes[ei].title };
+}
+
+function nowPlaying() {
+  if (!playbackCtx) return { playing: false, autoplay, live: !!streamProcess };
+  const s = playbackCtx.seasons[playbackCtx.currentSeason];
+  const ep = s.episodes[playbackCtx.currentEpisode];
+  return {
+    playing: true,
+    title: ep.title,
+    S: s.seasonIndex ?? (playbackCtx.currentSeason + 1),
+    E: ep.epIndex ?? (playbackCtx.currentEpisode + 1),
+    autoplay, live: !!streamProcess
+  };
+}
+
+// Lightweight ranked search for slash-command autocomplete (Doplarr-style):
+// returns top-level pickable titles with poster/summary metadata for rich cards.
+async function searchSuggest(partial) {
+  const { query } = parseQuery(partial || "");
+  if (!query || query.length < 2) return [];
+  const results = await searchPlex(query).catch(() => []);
+  const seen = new Set();
+  const out = [];
+  for (const r of results) {
+    if (r.type !== "movie" && r.type !== "show") continue;
+    const key = `${(r.title || "").toLowerCase()}|${r.year || ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      title: r.title,
+      year: r.year || null,
+      type: r.type,
+      ratingKey: r.ratingKey || null,
+      thumb: r.thumb || null,
+      summary: r.summary || null
+    });
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
+// ---- Localhost control API (the slash-command bot's backend) -----------------
+// Bound to 127.0.0.1 only and gated by a shared secret, so only a local
+// companion process (the real Discord bot) can drive the selfbot.
+function startControlApi() {
+  const cfg = config.controlApi || {};
+  if (!cfg.enabled) { console.debug("[control-api] disabled"); return; }
+  const port = cfg.port || 8742;
+  const secret = cfg.secret || "";
+
+  const server = http.createServer(async (req, res) => {
+    const reply = (code, obj) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj)); };
+    try {
+      if (secret && req.headers["x-pod-secret"] !== secret) return reply(401, { ok: false, error: "unauthorized" });
+      const url = new URL(req.url, "http://localhost");
+      const p = url.pathname;
+
+      let body = {};
+      if (req.method === "POST") {
+        const chunks = [];
+        for await (const c of req) chunks.push(c);
+        const raw = Buffer.concat(chunks).toString() || "{}";
+        try { body = JSON.parse(raw); } catch (e) { return reply(400, { ok: false, error: "bad json" }); }
+      }
+
+      if (req.method === "GET" && p === "/health") return reply(200, { ok: true });
+      if (req.method === "GET" && p === "/search") return reply(200, { ok: true, results: await searchSuggest(url.searchParams.get("q") || "") });
+      if (req.method === "GET" && p === "/nowplaying") return reply(200, { ok: true, ...nowPlaying() });
+      if (req.method === "POST" && p === "/play") return reply(200, await doPlay({ rawQuery: body.query, guildId: body.guildId, channelId: body.channelId, textChannelId: body.textChannelId }));
+      if (req.method === "POST" && p === "/next") return reply(200, doSkip(1));
+      if (req.method === "POST" && p === "/back") return reply(200, doSkip(-1));
+      if (req.method === "POST" && p === "/qp") return reply(200, doJump(parseInt(body.season, 10), parseInt(body.episode, 10)));
+      if (req.method === "POST" && p === "/stop") { stopChild(); return reply(200, { ok: true }); }
+      if (req.method === "POST" && p === "/autoplay") { autoplay = !!body.on; return reply(200, { ok: true, autoplay }); }
+      return reply(404, { ok: false, error: "not found" });
+    } catch (err) {
+      console.error("[control-api] error:", err && err.message ? err.message : err);
+      reply(500, { ok: false, error: err && err.message ? err.message : String(err) });
+    }
+  });
+  server.on("error", e => console.error("[control-api] server error:", e.message));
+  server.listen(port, "127.0.0.1", () => console.debug(`[control-api] listening on 127.0.0.1:${port}`));
+}
+
 const client = new Client({ checkUpdate: false });
 
 client.on("ready", () => {
@@ -338,107 +512,25 @@ client.on("messageCreate", async msg => {
       const rawQuery = raw.slice(cmd.length).trim();
       if (!rawQuery) return msg.reply("❌ You must specify a title.");
 
-      const { query, epTarget } = parseQuery(rawQuery);
-      console.debug("[debug] Searching Plex for:", query, "epTarget:", JSON.stringify(epTarget));
-      const { host, token } = config.plex;
-
-      const results = await searchPlex(query);
-      console.debug("[debug] ranked", results.length, "playable; top:", results[0]?.title);
-      if (!results.length) {
-        const sugg = await suggestPlex(query);
-        if (sugg.length) {
-          const list = sugg.map(m => `• ${m.title}${m.year ? ` (${m.year})` : ""}`).join("\n");
-          return msg.reply(`❓ No match for "${query}". Did you mean:\n${list}`);
-        }
-        return msg.reply(`❌ No Plex match for "${query}". Try fewer/simpler words.`);
+      // Shared with the slash-command control API — see doPlay().
+      const r = await doPlay({
+        rawQuery,
+        guildId: voice.guild.id,
+        channelId: voice.id,
+        textChannelId: msg.channel.id
+      });
+      if (r.ok) return msg.reply(`▶️ Now playing (S${r.S}E${r.E}): ${r.title}`);
+      if (r.reason === "ep-not-found") {
+        return msg.reply(`❌ Found "${r.title}" but not S${r.epTarget.season}E${r.epTarget.episode}.`);
       }
-
-      // If an episode was explicitly requested, prefer a series result over a
-      // like-named movie (movies otherwise get a small ranking bonus).
-      let first = results[0];
-      if (epTarget) {
-        const seriesHit = results.find(r => r.type === "show" || r.type === "season" || r.type === "episode");
-        if (seriesHit) first = seriesHit;
+      if (r.reason === "not-found") {
+        if (r.suggestions && r.suggestions.length) {
+          const list = r.suggestions.map(m => `• ${m.title}${m.year ? ` (${m.year})` : ""}`).join("\n");
+          return msg.reply(`❓ No match for "${r.query}". Did you mean:\n${list}`);
+        }
+        return msg.reply(`❌ No Plex match for "${r.query}". Try fewer/simpler words.`);
       }
-      playbackCtx = {
-        seasons: [],
-        currentSeason: 0,
-        currentEpisode: 0,
-        // Where to post autoplay/end-of-series notices (exit handler has no msg).
-        textChannelId: msg.channel.id,
-        voiceChannel: {
-          guildId: voice.guild.id,
-          channelId: voice.id
-        }
-      };
-
-      if (first.type === "movie") {
-        playbackCtx.seasons.push({
-          title: first.title,
-          episodes: [{ title: first.title, filePath: first.Media[0].Part[0].file }]
-        });
-      } else {
-        const showKey = first.grandparentRatingKey || first.parentRatingKey || first.ratingKey;
-        console.debug("[debug] Fetching seasons for showKey", showKey);
-        const seasonsResp = await axios.get(
-          `${host}/library/metadata/${showKey}/children`,
-          { params: { "X-Plex-Token": token } }
-        );
-        const seasons = seasonsResp.data.MediaContainer?.Metadata || [];
-        console.debug("[debug] Found", seasons.length, "seasons");
-
-        for (const s of seasons) {
-          console.debug("[debug] Season", s.index, "- fetching episodes");
-          const epsResp = await axios.get(
-            `${host}/library/metadata/${s.ratingKey}/children`,
-            { params: { "X-Plex-Token": token } }
-          );
-          const eps = (epsResp.data.MediaContainer?.Metadata || []).sort((a,b) => a.index - b.index);
-          const episodes = eps.map(ep => ({
-            title: `${ep.grandparentTitle} S${String(ep.parentIndex).padStart(2,'0')}E${String(ep.index).padStart(2,'0')} – ${ep.title}`,
-            filePath: ep.Media[0].Part[0].file,
-            epIndex: ep.index
-          }));
-          playbackCtx.seasons.push({ title: `Season ${s.index}`, seasonIndex: s.index, episodes });
-        }
-
-        if (epTarget) {
-          // Jump to an explicit SxxExx, matching on Plex's real season/episode
-          // numbers (handles Specials = Season 0 shifting array positions).
-          const si = playbackCtx.seasons.findIndex(s => s.seasonIndex === epTarget.season);
-          const ei = si >= 0
-            ? playbackCtx.seasons[si].episodes.findIndex(e => e.epIndex === epTarget.episode)
-            : -1;
-          if (si < 0 || ei < 0) {
-            return msg.reply(`❌ Found "${first.title}" but not S${epTarget.season}E${epTarget.episode}.`);
-          }
-          playbackCtx.currentSeason = si;
-          playbackCtx.currentEpisode = ei;
-        } else if (first.type === "episode") {
-          outer: for (let si = 0; si < playbackCtx.seasons.length; si++) {
-            const eps = playbackCtx.seasons[si].episodes;
-            for (let ei = 0; ei < eps.length; ei++) {
-              if (eps[ei].title.includes(first.title)) {
-                playbackCtx.currentSeason = si;
-                playbackCtx.currentEpisode = ei;
-                break outer;
-              }
-            }
-          }
-        }
-      }
-
-      const curSeason = playbackCtx.seasons[playbackCtx.currentSeason];
-      const curEp = curSeason.episodes[playbackCtx.currentEpisode];
-      const S0 = curSeason.seasonIndex ?? (playbackCtx.currentSeason + 1);
-      const E0 = curEp.epIndex ?? (playbackCtx.currentEpisode + 1);
-      const nowTitle = curEp.title;
-      await msg.reply(`▶️ Now playing (S${S0}E${E0}): ${nowTitle}`);
-
-      // If the live child is on a different voice channel, restart it there;
-      // otherwise reuse the open Go-Live session for a seamless switch.
-      if (childChannelId && childChannelId !== voice.id) stopChild();
-      sendPlay();
+      return msg.reply("❌ Couldn't play that.");
     }
 
     else if (cmd === "!pnext" || cmd === "!pback") {
@@ -496,3 +588,6 @@ client.on("messageCreate", async msg => {
 });
 
 client.login(config.token);
+
+// Start the localhost control API for the slash-command companion bot.
+startControlApi();

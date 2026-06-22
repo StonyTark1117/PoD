@@ -20,5 +20,11 @@
   "audioBitrateKbps": 128,
 
   "allowedGuilds": ["STREAM_GUILD_ID"],
-  "autoplay": true
+  "autoplay": true,
+
+  "controlApi": {
+    "enabled": true,
+    "port": 8742,
+    "secret": "RANDOM_SHARED_SECRET"
+  }
 }
