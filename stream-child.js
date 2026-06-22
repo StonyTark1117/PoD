@@ -77,7 +77,14 @@ async function ensureSession(ctx) {
   // Open the Go-Live tile exactly once. We reuse this `conn` for every episode,
   // which is what keeps the watch-together alive across transitions.
   conn = await streamer.createStream();
-  console.debug("[stream-child] Go-Live stream created (persistent)");
+  // Build the RTP packetizer ONCE per session. setPacketizer() makes fresh
+  // RtpPacketizationConfig objects (sequence numbers reset to a new base); calling
+  // it again per-episode reuses sequence numbers within the SAME SRTP session,
+  // which libsrtp's protect() rejects as keystream reuse ("SRTP protect error,
+  // status=10") and crashes the child. One packetizer = monotonic seq/timestamp
+  // across all episodes, so the changeover is a continuous RTP stream + new keyframe.
+  conn.setPacketizer(packetizerFor(config.streamOpts.videoCodec));
+  console.debug("[stream-child] Go-Live stream created (persistent), packetizer set");
 }
 
 // Stream one file into the existing `conn`. Resolves nothing; signals the parent
@@ -125,7 +132,8 @@ async function playItem(item) {
   if (myGen !== playGen) return;  // superseded while demuxing — drop it
   if (!video) return send({ type: "failed", title: item.title });
 
-  conn.setPacketizer(packetizerFor(config.streamOpts.videoCodec));
+  // NOTE: packetizer is set ONCE in ensureSession (see why there) — never per
+  // episode, or sequence-number reuse crashes the SRTP session.
   conn.mediaConnection.setSpeaking(true);
   conn.mediaConnection.setVideoAttributes(true, {
     width: config.streamOpts.width,
