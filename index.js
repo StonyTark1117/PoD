@@ -6,6 +6,24 @@ const config = require("./config.json");
 
 const COMMANDS = ["!pplay", "!pnext", "!pback", "!pstop", "!pqp", "!pautoplay"];
 
+// Discord reserves "/" for native (bot-application) slash commands, which a
+// selfbot/user account can't register — so we stay on "!" and provide a help
+// listing for discoverability instead.
+const HELP_ALIASES = ["!phelp", "!help", "!pcommands", "!pcmds", "!pod"];
+const HELP_TEXT = [
+  "🎬 **PoD — Plex on Discord** · available commands:",
+  "",
+  "▶️ `!pplay <title>` — search Plex & start streaming (movies or TV).",
+  "  ↳ understands episodes & years: `!pplay house s3e1`, `!pplay dune (2021)`",
+  "⏭️ `!pnext`  ·  ⏮️ `!pback` — next / previous episode (TV shows).",
+  "🔢 `!pqp <season>-<episode>` — jump to a specific episode, e.g. `!pqp 2-5`.",
+  "📺 `!pautoplay on|off` — auto-advance to the next episode when one ends (default on).",
+  "⏹️ `!pstop` — stop streaming & disconnect.",
+  "❓ `!phelp` — show this list.",
+  "",
+  "_Tip: join a voice channel before `!pplay`._"
+].join("\n");
+
 // When a TV episode finishes cleanly, optionally roll into the next episode.
 // Runtime-mutable via !pautoplay on/off; default comes from config (off if unset).
 // Off by default so an unattended crash/disconnect can't burn through a whole show.
@@ -296,7 +314,18 @@ client.on("messageCreate", async msg => {
 
   const raw = msg.content.trim();
   const cmd = COMMANDS.find(c => raw.startsWith(c));
-  if (!cmd) return;
+  if (!cmd) {
+    const lc = raw.toLowerCase();
+    // Explicit help request -> full command menu.
+    if (HELP_ALIASES.some(h => lc === h || lc.startsWith(h + " "))) {
+      return msg.reply(HELP_TEXT);
+    }
+    // Looks like one of our commands but isn't recognized (typo) -> nudge.
+    if (/^!p[a-z]/i.test(raw)) {
+      return msg.reply("❓ Unknown command. Type `!phelp` to see what I can do.");
+    }
+    return;  // not addressed to us
+  }
 
   console.debug("[debug] Command:", cmd);
   const voice = msg.member?.voice.channel;

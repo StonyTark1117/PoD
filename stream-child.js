@@ -16,6 +16,7 @@ const streamer = new Streamer(client);
 
 let conn = null;            // the persistent Go-Live StreamConnection (createStream once)
 let curController = null;   // AbortController for the currently-playing item's ffmpeg
+let curCommand = null;      // the fluent-ffmpeg command for the current item
 let curVStream = null;      // current VideoStream writer (into `conn`)
 let curAStream = null;      // current AudioStream writer (into `conn`)
 let playGen = 0;            // generation counter; every play/stop bumps it to invalidate stale work
@@ -47,6 +48,12 @@ function buildEncoder() {
 function stopCurrentMedia() {
   playGen++;  // any in-flight playItem for the old generation will bail
   if (curController) { try { curController.abort(); } catch (e) {} curController = null; }
+  // SIGKILL the previous ffmpeg directly. abort() above sends SIGTERM (via
+  // prepareStream's cancel handler), but a switched-away ffmpeg is blocked writing
+  // to a pipe nobody drains and defers SIGTERM forever — it would linger holding a
+  // file handle + an NVENC encoder context (~60 MiB GPU) and leak one per switch.
+  // SIGKILL can't be deferred, so it guarantees the GPU/FDs are released.
+  if (curCommand) { try { curCommand.kill("SIGKILL"); } catch (e) {} curCommand = null; }
   if (curVStream) { try { curVStream.destroy(); } catch (e) {} curVStream = null; }
   if (curAStream) { try { curAStream.destroy(); } catch (e) {} curAStream = null; }
   // Announce the video track as stopped (video_ssrc:0). playItem() re-announces it
@@ -111,6 +118,7 @@ async function playItem(item) {
     bitrateAudio: config.audioBitrateKbps
   }, controller.signal);
 
+  curCommand = command;  // tracked so stopCurrentMedia() can SIGKILL it on a switch
   let ffmpegErrored = false;
   command.on("start", c => console.debug("[stream-child][ffmpeg] start:", c));
   command.on("error", err => {
