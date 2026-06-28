@@ -20,6 +20,7 @@ let curCommand = null;      // the fluent-ffmpeg command for the current item
 let curVStream = null;      // current VideoStream writer (into `conn`)
 let curAStream = null;      // current AudioStream writer (into `conn`)
 let playGen = 0;            // generation counter; every play/stop bumps it to invalidate stale work
+let isPaused = false;       // true while the current item's ffmpeg is SIGSTOP'd (frozen)
 
 function send(msg) { try { process.send(msg); } catch (e) {} }
 
@@ -47,6 +48,7 @@ function buildEncoder() {
 // its ffmpeg and destroy its media writers. The tile + voice stay up.
 function stopCurrentMedia() {
   playGen++;  // any in-flight playItem for the old generation will bail
+  isPaused = false;  // SIGKILL below reaps the (possibly stopped) ffmpeg regardless
   if (curController) { try { curController.abort(); } catch (e) {} curController = null; }
   // SIGKILL the previous ffmpeg directly. abort() above sends SIGTERM (via
   // prepareStream's cancel handler), but a switched-away ffmpeg is blocked writing
@@ -170,6 +172,38 @@ async function playItem(item) {
   });
 }
 
+// Freeze the current item by stopping its ffmpeg process: the demuxed stream goes
+// dry, so VideoStream/AudioStream send no frames and Discord clients hold on the
+// last frame. SIGSTOP (not SIGTERM) leaves the process resumable and releases the
+// NVENC/CPU work while paused. The voice/UDP session is managed separately, so the
+// Go-Live tile stays up — no rejoin.
+function pauseMedia() {
+  if (isPaused) return true;
+  const pid = curCommand && curCommand.ffmpegProc && curCommand.ffmpegProc.pid;
+  if (!pid) return false;
+  try { process.kill(pid, "SIGSTOP"); } catch (e) { return false; }
+  isPaused = true;
+  console.debug("[stream-child] paused (SIGSTOP ffmpeg", pid + ")");
+  return true;
+}
+
+// Resume: re-anchor the media-stream timing FIRST. BaseMediaStream paces by
+// (pts-elapsed) vs (wall-clock-elapsed); wall clock kept running while frozen, so
+// without a reset it would compute sleep=0 and fast-forward through the whole gap.
+// resetTimingCompensation() clears the start anchors so the next frame re-bases the
+// clock. Then SIGCONT lets ffmpeg produce again.
+function resumeMedia() {
+  if (!isPaused) return true;
+  const pid = curCommand && curCommand.ffmpegProc && curCommand.ffmpegProc.pid;
+  if (!pid) return false;
+  try { if (curVStream) curVStream.resetTimingCompensation(); } catch (e) {}
+  try { if (curAStream) curAStream.resetTimingCompensation(); } catch (e) {}
+  try { process.kill(pid, "SIGCONT"); } catch (e) { return false; }
+  isPaused = false;
+  console.debug("[stream-child] resumed (SIGCONT ffmpeg", pid + ")");
+  return true;
+}
+
 function shutdown(code = 0) {
   stopCurrentMedia();
   try { if (conn) streamer.stopStream(); } catch (e) {}
@@ -185,6 +219,10 @@ process.on("message", async cmd => {
       await ensureSession(cmd.ctx);
       stopCurrentMedia();      // cut any current item (tile stays up)
       await playItem(cmd.item);
+    } else if (cmd.type === "pause") {
+      pauseMedia();
+    } else if (cmd.type === "resume") {
+      resumeMedia();
     } else if (cmd.type === "stop") {
       shutdown(0);
     }

@@ -5,7 +5,7 @@ const { Client } = require("discord.js-selfbot-v13");
 const axios = require("axios");
 const config = require("./config.json");
 
-const COMMANDS = ["!pplay", "!pnext", "!pback", "!pstop", "!pqp", "!pautoplay"];
+const COMMANDS = ["!pplay", "!pnext", "!pback", "!pstop", "!pqp", "!pautoplay", "!ppause"];
 
 // Discord reserves "/" for native (bot-application) slash commands, which a
 // selfbot/user account can't register — so we stay on "!" and provide a help
@@ -16,7 +16,8 @@ const HELP_TEXT = [
   "",
   "▶️ `!pplay <title>` — search Plex & start streaming (movies or TV).",
   "  ↳ understands episodes & years: `!pplay house s3e1`, `!pplay dune (2021)`",
-  "⏭️ `!pnext`  ·  ⏮️ `!pback` — next / previous episode (TV shows).",
+  "⏭️ `!pnext`  ·  ⏮️ `!pback` — next episode (TV) or next film in a collection.",
+  "⏸️ `!ppause` — pause / resume the current movie or episode.",
   "🔢 `!pqp <season>-<episode>` — jump to a specific episode, e.g. `!pqp 2-5`.",
   "📺 `!pautoplay on|off` — auto-advance to the next episode when one ends (default on).",
   "⏹️ `!pstop` — stop streaming & disconnect.",
@@ -29,6 +30,9 @@ const HELP_TEXT = [
 // Runtime-mutable via !pautoplay on/off; default comes from config (off if unset).
 // Off by default so an unattended crash/disconnect can't burn through a whole show.
 let autoplay = config.autoplay === true;
+// True while the current item is frozen (ffmpeg SIGSTOP'd in the child). Reset on
+// every new play/skip/stop so a fresh item always starts un-paused.
+let paused = false;
 // Suppress autoplay if a "clean" exit happened suspiciously fast (real episodes
 // run far longer than this) — a second guard against crash-loops even if the
 // child reports success after a mid-stream failure.
@@ -84,6 +88,48 @@ async function playableSections() {
     .filter(s => s.type === "movie" || s.type === "show")
     .map(s => s.key);
   return _sections;
+}
+
+let _movieSections = null;
+async function movieSections() {
+  if (_movieSections) return _movieSections;
+  const d = await plexGet("/library/sections");
+  _movieSections = (d.MediaContainer?.Directory || [])
+    .filter(s => s.type === "movie")
+    .map(s => s.key);
+  return _movieSections;
+}
+
+// Full metadata for a single item — carries Genre[], Collection[{tag,id}], year,
+// and the file path (search/hub results don't reliably include Genre/Collection).
+async function fetchItemFull(ratingKey) {
+  try {
+    const d = await plexGet(`/library/metadata/${ratingKey}`);
+    return d.MediaContainer?.Metadata?.[0] || null;
+  } catch (e) { return null; }
+}
+
+// All movies sharing a Plex collection (tag id), as ready-to-play entries sorted
+// in release order (year asc) so autoplay walks sequels 1 -> 2 -> 3. The collection
+// tag's `id` doubles as a section filter: /library/sections/{k}/all?collection={id}.
+async function collectionMovies(collId) {
+  const out = [];
+  for (const key of await movieSections()) {
+    try {
+      const d = await plexGet(`/library/sections/${key}/all`, { collection: collId });
+      for (const m of (d.MediaContainer?.Metadata || [])) {
+        const file = m.Media?.[0]?.Part?.[0]?.file;
+        if (file) out.push({
+          title: m.title, filePath: file, year: m.year || null,
+          genres: (m.Genre || []).map(g => g.tag), ratingKey: m.ratingKey
+        });
+      }
+    } catch (e) { /* ignore section error */ }
+  }
+  const seen = new Set();
+  return out
+    .filter(m => m.ratingKey && !seen.has(m.ratingKey) ? seen.add(m.ratingKey) : false)
+    .sort((a, b) => (a.year || 0) - (b.year || 0) || a.title.localeCompare(b.title));
 }
 
 // Returns playable Plex items ranked best-match first ([] if none).
@@ -214,6 +260,7 @@ function ensureChild() {
 // child first if none is running.
 function sendPlay() {
   if (!playbackCtx) return;
+  paused = false;  // a fresh item always starts playing
   const item = currentItem();
   const child = ensureChild();
   childChannelId = playbackCtx.voiceChannel.channelId;
@@ -223,6 +270,7 @@ function sendPlay() {
 
 // Gracefully stop + disconnect the child (it tears down voice/Go-Live and exits).
 function stopChild() {
+  paused = false;
   if (!streamProcess) return;
   childStopping = true;
   try { streamProcess.send({ type: "stop" }); }
@@ -281,11 +329,14 @@ function onItemEnded() {
   }
   const adv = advanceCtx(1);
   if (!adv.ok) {
-    notify(ctx, "📺 Reached the end — nothing left to autoplay.");
+    notify(ctx, playbackCtx.kind === "movie"
+      ? "🎬 End of the collection — nothing left to autoplay."
+      : "📺 Reached the end — nothing left to autoplay.");
     return;
   }
-  console.debug(`[debug] Autoplay -> S${adv.S}E${adv.E}: ${adv.title}`);
-  notify(ctx, `⏭️ Up next (S${adv.S}E${adv.E}): ${adv.title}`);
+  const p = itemPayload();
+  console.debug(`[debug] Autoplay -> ${fmtItem(p)}`);
+  notify(ctx, p.kind === "movie" ? `🎬 Up next: ${fmtItem(p)}` : `⏭️ Up next ${fmtItem(p)}`);
   sendPlay();  // seamless — same Go-Live tile, new media
 }
 
@@ -325,8 +376,32 @@ async function doPlay({ rawQuery, guildId, channelId, textChannelId }) {
   };
 
   if (first.type === "movie") {
-    ctx.seasons.push({ title: first.title, episodes: [{ title: first.title, filePath: first.Media[0].Part[0].file }] });
+    ctx.kind = "movie";
+    // Pull full metadata for genres (the "category" we show instead of S/E) and the
+    // movie's collection. If it belongs to a collection with siblings, model the whole
+    // collection as one "season" of movies so !pnext / autoplay roll into the sequels.
+    const full = await fetchItemFull(first.ratingKey);
+    const genres = (full?.Genre || []).map(g => g.tag);
+    const file = full?.Media?.[0]?.Part?.[0]?.file || first.Media[0].Part[0].file;
+    const coll = (full?.Collection || [])[0] || null;
+    let episodes = null, curIdx = 0;
+    if (coll && coll.id != null) {
+      const sibs = await collectionMovies(coll.id);
+      if (sibs.length > 1) {
+        curIdx = sibs.findIndex(s => String(s.ratingKey) === String(first.ratingKey));
+        if (curIdx < 0) curIdx = 0;
+        episodes = sibs;
+        ctx.collectionTitle = coll.tag || null;
+      }
+    }
+    if (!episodes) {
+      episodes = [{ title: first.title, filePath: file, year: full?.year || first.year || null, genres }];
+      curIdx = 0;
+    }
+    ctx.seasons.push({ title: ctx.collectionTitle || first.title, episodes });
+    ctx.currentEpisode = curIdx;
   } else {
+    ctx.kind = "tv";
     const showKey = first.grandparentRatingKey || first.parentRatingKey || first.ratingKey;
     const seasonsResp = await axios.get(`${host}/library/metadata/${showKey}/children`, { params: { "X-Plex-Token": token } });
     const seasons = seasonsResp.data.MediaContainer?.Metadata || [];
@@ -356,13 +431,9 @@ async function doPlay({ rawQuery, guildId, channelId, textChannelId }) {
   }
 
   playbackCtx = ctx;
-  const curSeason = playbackCtx.seasons[playbackCtx.currentSeason];
-  const curEp = curSeason.episodes[playbackCtx.currentEpisode];
-  const S = curSeason.seasonIndex ?? (playbackCtx.currentSeason + 1);
-  const E = curEp.epIndex ?? (playbackCtx.currentEpisode + 1);
   if (childChannelId && childChannelId !== channelId) stopChild();
   sendPlay();
-  return { ok: true, type: first.type, title: curEp.title, S, E };
+  return { ok: true, type: first.type, ...playState() };
 }
 
 // Skip ±1 episode and replay (seamless). Returns the new position or a reason.
@@ -371,7 +442,7 @@ function doSkip(delta) {
   const adv = advanceCtx(delta);
   if (!adv.ok) return { ok: false, reason: "end" };
   sendPlay();
-  return { ok: true, S: adv.S, E: adv.E, title: adv.title };
+  return { ok: true, ...playState() };
 }
 
 // Jump to a specific REAL season/episode number (not array index).
@@ -382,22 +453,76 @@ function doJump(season, episode) {
   if (si < 0 || ei < 0) return { ok: false, reason: "not-found" };
   playbackCtx.currentSeason = si; playbackCtx.currentEpisode = ei;
   sendPlay();
-  const S = playbackCtx.seasons[si].seasonIndex ?? (si + 1);
-  const E = playbackCtx.seasons[si].episodes[ei].epIndex ?? (ei + 1);
-  return { ok: true, S, E, title: playbackCtx.seasons[si].episodes[ei].title };
+  return { ok: true, ...playState() };
+}
+
+// Would advancing by `delta` land on a real item? (non-mutating — mirrors
+// advanceCtx). Drives the Back/Next button enabled-state in the companion bot.
+function canAdvance(delta) {
+  if (!playbackCtx) return false;
+  let { currentSeason: cs, currentEpisode: ce, seasons } = playbackCtx;
+  ce += delta;
+  if (ce < 0 && cs > 0) { cs--; ce = seasons[cs].episodes.length - 1; }
+  else if (ce >= seasons[cs].episodes.length && cs < seasons.length - 1) { cs++; ce = 0; }
+  return !(cs < 0 || cs >= seasons.length || ce < 0 || ce >= seasons[cs].episodes.length);
+}
+
+function totalItems() {
+  if (!playbackCtx) return 0;
+  return playbackCtx.seasons.reduce((n, s) => n + s.episodes.length, 0);
+}
+
+// One consistent description of the current item for ALL callers (text replies,
+// slash commands, buttons). For TV: S/E. For movies: no episode, a genre "category"
+// + year + (collection name if it's a franchise). `multi` tells the companion
+// whether to show Back/Next/Autoplay at all — a standalone movie gets none.
+function itemPayload() {
+  const s = playbackCtx.seasons[playbackCtx.currentSeason];
+  const ep = s.episodes[playbackCtx.currentEpisode];
+  const p = { title: ep.title, kind: playbackCtx.kind || "tv" };
+  if (p.kind === "movie") {
+    p.S = null; p.E = null;
+    p.category = (ep.genres || []).slice(0, 3).join(", ") || null;
+    p.year = ep.year || null;
+    p.collection = playbackCtx.collectionTitle || null;
+  } else {
+    p.S = s.seasonIndex ?? (playbackCtx.currentSeason + 1);
+    p.E = ep.epIndex ?? (playbackCtx.currentEpisode + 1);
+  }
+  p.hasNext = canAdvance(1);
+  p.hasPrev = canAdvance(-1);
+  p.multi = totalItems() > 1;
+  return p;
+}
+
+// Full runtime state returned by play/skip/jump/nowplaying so the companion can
+// render the card + correct buttons in one shot.
+function playState() {
+  return { ...itemPayload(), autoplay, paused, live: !!streamProcess };
+}
+
+// Human-readable position for "!" text replies, kind-aware.
+function fmtItem(p) {
+  if (p.kind === "movie") return `${p.title}${p.year ? ` (${p.year})` : ""}`;
+  return `(S${p.S}E${p.E}): ${p.title}`;
 }
 
 function nowPlaying() {
-  if (!playbackCtx) return { playing: false, autoplay, live: !!streamProcess };
-  const s = playbackCtx.seasons[playbackCtx.currentSeason];
-  const ep = s.episodes[playbackCtx.currentEpisode];
-  return {
-    playing: true,
-    title: ep.title,
-    S: s.seasonIndex ?? (playbackCtx.currentSeason + 1),
-    E: ep.epIndex ?? (playbackCtx.currentEpisode + 1),
-    autoplay, live: !!streamProcess
-  };
+  if (!playbackCtx) return { playing: false, autoplay, paused, live: !!streamProcess };
+  return { playing: true, ...playState() };
+}
+
+// Freeze / unfreeze the current item. `on` undefined = toggle. The child SIGSTOPs
+// ffmpeg (frees the NVENC context while paused) and re-anchors playback timing on
+// resume so it doesn't fast-forward through the gap. Works for movies AND TV.
+function doPause(on) {
+  if (!streamProcess || !playbackCtx) return { ok: false, reason: "nothing" };
+  const target = (typeof on === "boolean") ? on : !paused;
+  if (target === paused) return { ok: true, paused };
+  try { streamProcess.send({ type: target ? "pause" : "resume" }); }
+  catch (e) { return { ok: false, reason: "nothing" }; }
+  paused = target;
+  return { ok: true, paused };
 }
 
 // Lightweight ranked search for slash-command autocomplete (Doplarr-style):
@@ -467,6 +592,7 @@ function startControlApi() {
       if (req.method === "POST" && p === "/qp") return reply(200, doJump(parseInt(body.season, 10), parseInt(body.episode, 10)));
       if (req.method === "POST" && p === "/stop") { stopChild(); return reply(200, { ok: true }); }
       if (req.method === "POST" && p === "/autoplay") { autoplay = !!body.on; return reply(200, { ok: true, autoplay }); }
+      if (req.method === "POST" && p === "/pause") return reply(200, doPause(typeof body.on === "boolean" ? body.on : undefined));
       return reply(404, { ok: false, error: "not found" });
     } catch (err) {
       console.error("[control-api] error:", err && err.message ? err.message : err);
@@ -527,7 +653,7 @@ client.on("messageCreate", async msg => {
         channelId: voice.id,
         textChannelId: msg.channel.id
       });
-      if (r.ok) return msg.reply(`▶️ Now playing (S${r.S}E${r.E}): ${r.title}`);
+      if (r.ok) return msg.reply(`▶️ Now playing ${fmtItem(r)}`);
       if (r.reason === "ep-not-found") {
         return msg.reply(`❌ Found "${r.title}" but not S${r.epTarget.season}E${r.epTarget.episode}.`);
       }
@@ -543,14 +669,15 @@ client.on("messageCreate", async msg => {
 
     else if (cmd === "!pnext" || cmd === "!pback") {
       console.debug("[debug] Skip:", cmd);
-      if (!playbackCtx) return msg.reply("❌ Nothing playing.");
-      const adv = advanceCtx(cmd === "!pnext" ? 1 : -1);
-      if (!adv.ok) {
-        return msg.reply("⚠️ No more items.");
-      }
-      await msg.reply(`▶️ Now playing (S${adv.S}E${adv.E}): ${adv.title}`);
+      const r = doSkip(cmd === "!pnext" ? 1 : -1);
+      if (!r.ok) return msg.reply(r.reason === "nothing" ? "❌ Nothing playing." : "⚠️ No more items.");
+      await msg.reply(`▶️ Now playing ${fmtItem(r)}`);  // doSkip() already started it
+    }
 
-      sendPlay();
+    else if (cmd === "!ppause") {
+      const r = doPause();  // toggle
+      if (!r.ok) return msg.reply("❌ Nothing playing.");
+      await msg.reply(r.paused ? "⏸️ Paused." : "▶️ Resumed.");
     }
 
     else if (cmd === "!pautoplay") {
@@ -576,10 +703,7 @@ client.on("messageCreate", async msg => {
       }
       playbackCtx.currentSeason = si;
       playbackCtx.currentEpisode = ei;
-      const S2 = seasons[si].seasonIndex ?? (si + 1);
-      const E2 = seasons[si].episodes[ei].epIndex ?? (ei + 1);
-      const t2 = seasons[si].episodes[ei].title;
-      await msg.reply(`▶️ Now playing (S${S2}E${E2}): ${t2}`);
+      await msg.reply(`▶️ Now playing ${fmtItem(itemPayload())}`);
 
       sendPlay();
     }
